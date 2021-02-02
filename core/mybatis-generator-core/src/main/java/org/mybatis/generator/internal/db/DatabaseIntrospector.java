@@ -1,5 +1,5 @@
 /**
- *    Copyright 2006-2018 the original author or authors.
+ *    Copyright 2006-2021 the original author or authors.
  *
  *    Licensed under the Apache License, Version 2.0 (the "License");
  *    you may not use this file except in compliance with the License.
@@ -15,43 +15,26 @@
  */
 package org.mybatis.generator.internal.db;
 
-import static org.mybatis.generator.internal.util.JavaBeansUtil.getCamelCaseString;
-import static org.mybatis.generator.internal.util.JavaBeansUtil.getValidPropertyName;
-import static org.mybatis.generator.internal.util.StringUtility.composeFullyQualifiedTableName;
-import static org.mybatis.generator.internal.util.StringUtility.isTrue;
-import static org.mybatis.generator.internal.util.StringUtility.stringContainsSQLWildcard;
-import static org.mybatis.generator.internal.util.StringUtility.stringContainsSpace;
-import static org.mybatis.generator.internal.util.StringUtility.stringHasValue;
-import static org.mybatis.generator.internal.util.messages.Messages.getString;
-
-import java.sql.DatabaseMetaData;
-import java.sql.ResultSet;
-import java.sql.ResultSetMetaData;
-import java.sql.SQLException;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.Iterator;
-import java.util.List;
-import java.util.Map;
-import java.util.StringTokenizer;
-import java.util.TreeMap;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
-
 import org.mybatis.generator.api.FullyQualifiedTable;
 import org.mybatis.generator.api.IntrospectedColumn;
 import org.mybatis.generator.api.IntrospectedTable;
 import org.mybatis.generator.api.JavaTypeResolver;
 import org.mybatis.generator.api.dom.java.FullyQualifiedJavaType;
 import org.mybatis.generator.api.dom.java.JavaReservedWords;
-import org.mybatis.generator.config.ColumnOverride;
-import org.mybatis.generator.config.Context;
-import org.mybatis.generator.config.GeneratedKey;
-import org.mybatis.generator.config.PropertyRegistry;
-import org.mybatis.generator.config.TableConfiguration;
+import org.mybatis.generator.config.*;
 import org.mybatis.generator.internal.ObjectFactory;
 import org.mybatis.generator.logging.Log;
 import org.mybatis.generator.logging.LogFactory;
+
+import java.sql.*;
+import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+import static org.mybatis.generator.internal.util.JavaBeansUtil.getCamelCaseString;
+import static org.mybatis.generator.internal.util.JavaBeansUtil.getValidPropertyName;
+import static org.mybatis.generator.internal.util.StringUtility.*;
+import static org.mybatis.generator.internal.util.messages.Messages.getString;
 
 /**
  * @author Jeff Butler
@@ -69,8 +52,8 @@ public class DatabaseIntrospector {
     private Log logger;
 
     public DatabaseIntrospector(Context context,
-            DatabaseMetaData databaseMetaData,
-            JavaTypeResolver javaTypeResolver, List<String> warnings) {
+                                DatabaseMetaData databaseMetaData,
+                                JavaTypeResolver javaTypeResolver, List<String> warnings) {
         super();
         this.context = context;
         this.databaseMetaData = databaseMetaData;
@@ -172,11 +155,11 @@ public class DatabaseIntrospector {
      * @throws SQLException
      *             if any errors in introspection
      */
-    public List<IntrospectedTable> introspectTables(TableConfiguration tc)
+    public List<IntrospectedTable> introspectTables(TableConfiguration tc,Connection conn)
             throws SQLException {
 
         // get the raw columns from the DB
-        Map<ActualTableName, List<IntrospectedColumn>> columns = getColumns(tc);
+        Map<ActualTableName, List<IntrospectedColumn>> columns = getColumns(tc,conn);
 
         if (columns.isEmpty()) {
             warnings.add(getString("Warning.19", tc.getCatalog(), //$NON-NLS-1$
@@ -431,7 +414,7 @@ public class DatabaseIntrospector {
     }
 
     private Map<ActualTableName, List<IntrospectedColumn>> getColumns(
-            TableConfiguration tc) throws SQLException {
+            TableConfiguration tc,Connection conn) throws SQLException {
         String localCatalog;
         String localSchema;
         String localTableName;
@@ -501,13 +484,12 @@ public class DatabaseIntrospector {
 
         if (logger.isDebugEnabled()) {
             String fullTableName = composeFullyQualifiedTableName(localCatalog, localSchema,
-                            localTableName, '.');
+                    localTableName, '.');
             logger.debug(getString("Tracing.1", fullTableName)); //$NON-NLS-1$
         }
 
         ResultSet rs = databaseMetaData.getColumns(localCatalog, localSchema,
                 localTableName, "%"); //$NON-NLS-1$
-
         boolean supportsIsAutoIncrement = false;
         boolean supportsIsGeneratedColumn = false;
         ResultSetMetaData rsmd = rs.getMetaData();
@@ -521,10 +503,38 @@ public class DatabaseIntrospector {
             }
         }
 
+        /**
+         * 数据库类型判断，如果是sqlServer则执行下面语句,做到对其他数据库的兼容
+         */
+        ResultSet sqlServerResultSet = null;
+        boolean isSqlServer = conn.getMetaData().getDriverName().toUpperCase()
+                .indexOf("SQL SERVER") != -1;
+        if (isSqlServer) {
+            //sqljdbc与sqljdbc4不同，sqlserver中间有空格
+            String sql = "SELECT\n" +
+                    "\tconvert(varchar(1000), C.\n" +
+                    "VALUE)\n" +
+                    "\tAS REMARKS\n" +
+                    "FROM\n" +
+                    "\tsys.tables A\n" +
+                    "INNER JOIN sys.columns B ON B.object_id = A.object_id\n" +
+                    "LEFT JOIN sys.extended_properties C ON C.major_id = B.object_id\n" +
+                    "AND C.minor_id = B.column_id\n" +
+                    "WHERE\n" +
+                    "\tA.name = ? ";
+            PreparedStatement ps = conn.prepareStatement(sql);
+            ps.setString(1, localTableName);
+            sqlServerResultSet = ps.executeQuery();
+        }
         while (rs.next()) {
             IntrospectedColumn introspectedColumn = ObjectFactory
                     .createIntrospectedColumn(context);
-
+            if (isSqlServer){
+                sqlServerResultSet.next();
+                introspectedColumn.setRemarks(sqlServerResultSet.getString("REMARKS")); //$NON-NLS-1$
+            }else {
+                introspectedColumn.setRemarks(rs.getString("REMARKS")); //$NON-NLS-1$
+            }
             introspectedColumn.setTableAlias(tc.getAlias());
             introspectedColumn.setJdbcType(rs.getInt("DATA_TYPE")); //$NON-NLS-1$
             introspectedColumn.setLength(rs.getInt("COLUMN_SIZE")); //$NON-NLS-1$
@@ -532,7 +542,7 @@ public class DatabaseIntrospector {
             introspectedColumn
                     .setNullable(rs.getInt("NULLABLE") == DatabaseMetaData.columnNullable); //$NON-NLS-1$
             introspectedColumn.setScale(rs.getInt("DECIMAL_DIGITS")); //$NON-NLS-1$
-            introspectedColumn.setRemarks(rs.getString("REMARKS")); //$NON-NLS-1$
+
             introspectedColumn.setDefaultValue(rs.getString("COLUMN_DEF")); //$NON-NLS-1$
 
             if (supportsIsAutoIncrement) {
@@ -567,6 +577,7 @@ public class DatabaseIntrospector {
             }
         }
 
+        closeResultSet(sqlServerResultSet);
         closeResultSet(rs);
 
         if (answer.size() > 1
